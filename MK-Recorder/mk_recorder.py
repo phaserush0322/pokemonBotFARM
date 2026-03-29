@@ -47,7 +47,7 @@ class Logger:
         self.text_widget = text_widget
         self.log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), log_file)
         # Clear old log on start
-        with open(self.log_path, "w") as f:
+        with open(self.log_path, "w", encoding="utf-8") as f:
             f.write(f"=== MK-Recorder Log Started {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
 
     def log(self, msg, tag="info"):
@@ -55,7 +55,7 @@ class Logger:
         line = f"[{timestamp}] {msg}"
 
         # Write to file
-        with open(self.log_path, "a") as f:
+        with open(self.log_path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
         # Write to text widget (thread-safe via after)
@@ -113,6 +113,69 @@ class ScreenWatcher:
 
     def reset(self):
         self._prev_frame = None
+
+
+# ══════════════════════════════════════════════════════════════
+#  Battle Detector - detects a button/image on screen and clicks it
+# ══════════════════════════════════════════════════════════════
+
+class BattleDetector:
+    def __init__(self):
+        self.enabled = False
+        self.run_button_region = None   # {"left", "top", "width", "height"}
+        self.run_button_image = None    # numpy array of what "Run" button looks like
+        self.match_threshold = 85       # similarity % to consider a match
+        self._local = threading.local()
+
+    def _get_sct(self):
+        if not hasattr(self._local, 'sct'):
+            self._local.sct = mss.mss()
+        return self._local.sct
+
+    def capture_run_button(self):
+        """Capture what the Run button looks like right now."""
+        if not self.run_button_region:
+            return None
+        screenshot = self._get_sct().grab(self.run_button_region)
+        self.run_button_image = np.array(
+            Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+        )
+        return self.run_button_image
+
+    def get_similarity(self):
+        """Get similarity % between current screen and captured Run button. Returns (similarity, is_match)."""
+        if self.run_button_image is None or not self.run_button_region:
+            return 0, False
+        try:
+            screenshot = self._get_sct().grab(self.run_button_region)
+            current = np.array(
+                Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+            )
+            if current.shape != self.run_button_image.shape:
+                return 0, False
+            diff = np.abs(current.astype(np.int16) - self.run_button_image.astype(np.int16))
+            similarity = round((1 - np.sum(diff) / (255 * current.size)) * 100, 1)
+            return similarity, similarity >= self.match_threshold
+        except Exception as e:
+            return -1, False
+
+    def is_battle(self):
+        """Check if the Run button is currently visible on screen."""
+        if not self.enabled:
+            return False
+        _, matched = self.get_similarity()
+        return matched
+
+    def click_run_button(self):
+        """Click the center of the Run button region."""
+        if not self.run_button_region:
+            return
+        mc = MouseController()
+        cx = self.run_button_region["left"] + self.run_button_region["width"] // 2
+        cy = self.run_button_region["top"] + self.run_button_region["height"] // 2
+        mc.position = (cx, cy)
+        time.sleep(0.1)
+        mc.click(MouseButton.left)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -175,6 +238,38 @@ class RegionSelector:
 #  Macro Recorder
 # ══════════════════════════════════════════════════════════════
 
+class WindowHelper:
+    """Helpers to find, focus, and restore windows using Win32 API."""
+
+    @staticmethod
+    def get_foreground_window():
+        return ctypes.windll.user32.GetForegroundWindow()
+
+    @staticmethod
+    def get_window_title(hwnd):
+        length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+        buf = ctypes.create_unicode_buffer(length + 1)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+        return buf.value
+
+    @staticmethod
+    def focus_window(hwnd):
+        """Bring a window to the foreground."""
+        if not hwnd:
+            return False
+        try:
+            # If minimized, restore it
+            SW_RESTORE = 9
+            if ctypes.windll.user32.IsIconic(hwnd):
+                ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
+            # Allow our process to set foreground window
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+            time.sleep(0.3)
+            return True
+        except Exception:
+            return False
+
+
 class MacroRecorder:
     def __init__(self):
         self.events = []
@@ -184,6 +279,8 @@ class MacroRecorder:
         self.start_time = 0
         self.loop_count = 1
         self.playback_speed = 1.0
+        self.target_window = None  # hwnd of the game window
+        self.target_window_title = ""
         self.mouse_controller = MouseController()
         self.keyboard_controller = KeyboardController()
         self._play_thread = None
@@ -197,6 +294,9 @@ class MacroRecorder:
         self.events = []
         self.recording = True
         self.start_time = time.perf_counter()
+        # Remember which window is focused (the game window)
+        self.target_window = WindowHelper.get_foreground_window()
+        self.target_window_title = WindowHelper.get_window_title(self.target_window)
         self._mouse_listener = mouse.Listener(
             on_move=self._on_mouse_move,
             on_click=self._on_mouse_click,
@@ -288,6 +388,7 @@ class MacroRecorder:
         self.paused = False
 
         def _play():
+            self.focus_target()
             loops = self.loop_count if self.loop_count > 0 else float("inf")
             current = 0
             while current < loops and not self._stop_playback.is_set():
@@ -305,9 +406,16 @@ class MacroRecorder:
         self._play_thread = threading.Thread(target=_play, daemon=True)
         self._play_thread.start()
 
+    def focus_target(self):
+        """Focus the game window that was active during recording."""
+        if self.target_window:
+            return WindowHelper.focus_window(self.target_window)
+        return False
+
     def play_once_blocking(self):
         self._stop_playback.clear()
         self.playing = True
+        self.focus_target()
         self._replay_once()
         self.playing = False
         return not self._stop_playback.is_set()
@@ -387,6 +495,7 @@ class OverlayApp:
     def __init__(self):
         self.recorder = MacroRecorder()
         self.watcher = ScreenWatcher()
+        self.battle_detector = BattleDetector()
         self.auto_farming = False
         self._auto_farm_thread = None
         self._stop_auto_farm = threading.Event()
@@ -509,6 +618,58 @@ class OverlayApp:
         # Separator
         tk.Frame(self.root, bg="#45475a", height=2).pack(fill="x", padx=8, pady=4)
 
+        # ── BATTLE ESCAPE ──
+        tk.Label(self.root, text="-- Battle Escape (Auto-Run) --", bg="#1e1e2e",
+                 fg="#cdd6f4", font=("Consolas", 10, "bold")).pack()
+
+        row_battle1 = tk.Frame(self.root, bg="#1e1e2e")
+        row_battle1.pack(fill="x", padx=4, pady=2)
+        tk.Button(row_battle1, text="1. Select Run Btn",
+                  command=self._select_run_button, **btn_style
+                  ).pack(side="left", expand=True, fill="x", padx=2)
+        tk.Button(row_battle1, text="2. Capture Run Btn",
+                  command=self._capture_run_button, **btn_style
+                  ).pack(side="left", expand=True, fill="x", padx=2)
+        tk.Button(row_battle1, text="3. Test",
+                  command=self._test_battle_detection, **btn_style
+                  ).pack(side="left", expand=True, fill="x", padx=2)
+
+        row_battle2 = tk.Frame(self.root, bg="#1e1e2e")
+        row_battle2.pack(fill="x", padx=4, pady=2)
+        self.battle_enabled_var = tk.BooleanVar(value=False)
+        self.btn_battle_toggle = tk.Checkbutton(
+            row_battle2, text="Enable Battle Escape",
+            variable=self.battle_enabled_var,
+            command=self._toggle_battle_escape,
+            bg="#1e1e2e", fg="#cdd6f4", selectcolor="#313244",
+            activebackground="#1e1e2e", activeforeground="#cdd6f4",
+            font=("Consolas", 10),
+        )
+        self.btn_battle_toggle.pack(side="left", padx=4)
+
+        tk.Label(row_battle2, text="Match:", **style).pack(side="left")
+        self.battle_threshold_var = tk.StringVar(value="85")
+        tk.Entry(row_battle2, textvariable=self.battle_threshold_var, width=3,
+                 bg="#313244", fg="#cdd6f4", insertbackground="#cdd6f4",
+                 font=("Consolas", 10), relief="flat").pack(side="left", padx=2)
+        tk.Label(row_battle2, text="%", **style).pack(side="left")
+
+        # Battle preview
+        row_battle3 = tk.Frame(self.root, bg="#1e1e2e")
+        row_battle3.pack(fill="x", padx=4, pady=2)
+        self.battle_preview_label = tk.Label(row_battle3, text="No capture", bg="#313244",
+                                              fg="#6c7086", width=16, height=3,
+                                              font=("Consolas", 8))
+        self.battle_preview_label.pack(side="left", padx=4)
+        self.battle_status_var = tk.StringVar(value="Battle: not configured")
+        self.battle_status_label = tk.Label(row_battle3, textvariable=self.battle_status_var,
+                                             bg="#1e1e2e", fg="#6c7086",
+                                             font=("Consolas", 10))
+        self.battle_status_label.pack(side="left", padx=8)
+
+        # Separator
+        tk.Frame(self.root, bg="#45475a", height=2).pack(fill="x", padx=8, pady=4)
+
         # ── DEBUG LOG PANEL ──
         tk.Label(self.root, text="-- Debug Log --", bg="#1e1e2e",
                  fg="#cdd6f4", font=("Consolas", 10, "bold")).pack()
@@ -621,6 +782,10 @@ class OverlayApp:
             self.status_var.set("Recording... (press F6 to stop)")
             self.btn_record.config(text="Stop Rec [F6]", bg="#f38ba8", state="normal")
             self.logger.log("RECORDING STARTED - capturing mouse & keyboard", "macro")
+            self.logger.log(
+                f"Target window saved: '{self.recorder.target_window_title}' "
+                f"(hwnd={self.recorder.target_window})", "info"
+            )
 
     # ── Play ───────────────────────────────────────────────────
 
@@ -701,6 +866,86 @@ class OverlayApp:
         selector.root.protocol("WM_DELETE_WINDOW", lambda: (
             selector.root.destroy(), on_cancel()))
 
+    # ── Battle Escape ──────────────────────────────────────────
+
+    def _select_run_button(self):
+        """Let user select where the Run button appears on screen."""
+        self.root.withdraw()
+        time.sleep(0.2)
+
+        def on_selected(region):
+            self.battle_detector.run_button_region = region
+            self.root.deiconify()
+            self.status_var.set(
+                f"Run button region: ({region['left']},{region['top']}) "
+                f"{region['width']}x{region['height']}"
+            )
+            self.logger.log(
+                f"RUN BUTTON REGION SET: x={region['left']}, y={region['top']}, "
+                f"w={region['width']}, h={region['height']}", "info"
+            )
+
+        def on_cancel():
+            self.root.deiconify()
+
+        selector = RegionSelector(on_selected)
+        selector.root.protocol("WM_DELETE_WINDOW", lambda: (
+            selector.root.destroy(), on_cancel()))
+
+    def _capture_run_button(self):
+        """Capture what the Run button looks like right now."""
+        if not self.battle_detector.run_button_region:
+            self.status_var.set("Select the Run button region first!")
+            return
+        img = self.battle_detector.capture_run_button()
+        if img is not None:
+            # Show preview
+            pil_img = Image.fromarray(img).resize((100, 40))
+            photo = ImageTk.PhotoImage(pil_img)
+            self.battle_preview_label.config(image=photo, text="")
+            self.battle_preview_label._photo = photo
+            self.battle_status_var.set("Run btn captured!")
+            self.logger.log("RUN BUTTON CAPTURED - battle escape ready", "info")
+        else:
+            self.status_var.set("Capture failed!")
+
+    def _test_battle_detection(self):
+        """Test if the Run button is detected right now."""
+        if self.battle_detector.run_button_image is None:
+            self.status_var.set("Capture the Run button first!")
+            return
+        sim, matched = self.battle_detector.get_similarity()
+        if sim < 0:
+            self.logger.log(f"TEST BATTLE: ERROR getting similarity", "error")
+        elif matched:
+            self.logger.log(f"TEST BATTLE: MATCH! Similarity={sim}% >= {self.battle_detector.match_threshold}%", "trigger")
+            self.battle_status_var.set(f"TEST: MATCH {sim}%")
+            self.battle_status_label.config(fg="#a6e3a1")
+        else:
+            self.logger.log(f"TEST BATTLE: NO match. Similarity={sim}% < {self.battle_detector.match_threshold}%", "active")
+            self.battle_status_var.set(f"TEST: NO {sim}%")
+            self.battle_status_label.config(fg="#f38ba8")
+
+    def _toggle_battle_escape(self):
+        enabled = self.battle_enabled_var.get()
+        if enabled and self.battle_detector.run_button_image is None:
+            self.battle_enabled_var.set(False)
+            self.status_var.set("Capture the Run button first!")
+            return
+        self.battle_detector.enabled = enabled
+        try:
+            self.battle_detector.match_threshold = float(self.battle_threshold_var.get())
+        except ValueError:
+            self.battle_detector.match_threshold = 85
+        if enabled:
+            self.logger.log("BATTLE ESCAPE ENABLED", "info")
+            self.battle_status_var.set("Battle: ARMED")
+            self.battle_status_label.config(fg="#a6e3a1")
+        else:
+            self.logger.log("BATTLE ESCAPE DISABLED", "info")
+            self.battle_status_var.set("Battle: disabled")
+            self.battle_status_label.config(fg="#6c7086")
+
     # ── Auto-Farm ──────────────────────────────────────────────
 
     def _toggle_auto_farm(self):
@@ -753,6 +998,62 @@ class OverlayApp:
 
             while not self._stop_auto_farm.is_set():
                 check_num += 1
+
+                # ── Battle check (before idle check) ──
+                if self.battle_detector.enabled:
+                    try:
+                        battle_sim, in_battle = self.battle_detector.get_similarity()
+                        if check_num % 5 == 0:
+                            self.logger.log(
+                                f"BATTLE CHECK #{check_num}: similarity={battle_sim}% "
+                                f"(need >= {self.battle_detector.match_threshold}%) "
+                                f"-> {'BATTLE!' if in_battle else 'no battle'}",
+                                "trigger" if in_battle else "info"
+                            )
+                        if in_battle:
+                            self.logger.log("!" * 50, "error")
+                            self.logger.log("BATTLE DETECTED! Clicking Run button...", "error")
+                            self.logger.log("!" * 50, "error")
+                            self.root.after(0, lambda: (
+                                self.status_var.set("BATTLE! Clicking Run..."),
+                                self.battle_status_var.set("Battle: ESCAPING!"),
+                                self.battle_status_label.config(fg="#f38ba8"),
+                            ))
+
+                            # Focus game window first, then click Run
+                            self.recorder.focus_target()
+                            time.sleep(0.3)
+                            self.battle_detector.click_run_button()
+                            self.logger.log("Clicked Run button!", "macro")
+
+                            # Wait for battle to end
+                            time.sleep(2.0)
+
+                            # Check if still in battle (might need to click again)
+                            for retry in range(5):
+                                if self._stop_auto_farm.is_set():
+                                    break
+                                if self.battle_detector.is_battle():
+                                    self.logger.log(f"Still in battle, clicking Run again (retry {retry+1})...", "error")
+                                    self.battle_detector.click_run_button()
+                                    time.sleep(2.0)
+                                else:
+                                    break
+
+                            self.logger.log("Battle escaped! Resuming farm watch...", "info")
+                            self.root.after(0, lambda: (
+                                self.battle_status_var.set("Battle: ARMED"),
+                                self.battle_status_label.config(fg="#a6e3a1"),
+                            ))
+                            idle_start = None
+                            self.watcher.reset()
+                            time.sleep(1.0)
+                            self.watcher.reset()
+                            continue
+                    except Exception as e:
+                        self.logger.log(f"Battle check error: {e}", "error")
+
+                # ── Idle check ──
                 change = self.watcher.get_change_percent()
 
                 is_idle = change < idle_threshold
@@ -795,13 +1096,16 @@ class OverlayApp:
                             "trigger"
                         )
                         self.logger.log("=" * 50, "trigger")
+                        self.logger.log(
+                            f"Focusing game window: '{self.recorder.target_window_title}'", "info"
+                        )
 
                         self.root.after(0, lambda n=cycle: (
                             self.status_var.set(f"Auto-Farm: TRIGGERED! Running macro (#{n})..."),
                             self.info_var.set(f"Events: {len(self.recorder.events)}  |  Farm cycle: {n}"),
                         ))
 
-                        # Play macro
+                        # Play macro (focus_target is called inside play_once_blocking)
                         macro_start = time.perf_counter()
                         self.recorder.play_once_blocking()
                         macro_duration = time.perf_counter() - macro_start
